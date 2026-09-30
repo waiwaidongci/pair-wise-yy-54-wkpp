@@ -1,12 +1,18 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
 import { useSchemeStore } from '../store/scheme'
+import { geometryHash } from '../lib/sync'
 
 const store = useSchemeStore()
 const mapEl = ref<HTMLDivElement>()
 let map: MapLibreMap | undefined
 const layers = ref({ closure: true, detour: true, ambulance: true, bus: true, adjacent: true })
+
+/** 地图按审批快照判断：有生效快照就渲染快照几何，否则渲染当前几何 */
+const viewStages = computed(() => store.activeSnapshot?.stages ?? store.scheme.stages)
+const viewDetours = computed(() => store.activeSnapshot?.detours ?? store.scheme.detours)
+const viewStage = computed(() => viewStages.value.find((item) => item.id === store.selectedStageId))
 
 function addGeoSource(id: string, coordinates: [number, number][], color: string, dasharray?: number[]) {
   if (!map?.isStyleLoaded()) return
@@ -17,16 +23,15 @@ function addGeoSource(id: string, coordinates: [number, number][], color: string
 
 function drawAll() {
   if (!map?.isStyleLoaded()) return
-  const stage = store.selectedStage
-  if (stage) addGeoSource('closure', stage.route, '#ef4444')
-  store.scheme.detours.forEach((route, index) => addGeoSource(`detour-${index}`, route.coordinates, '#2563eb', [2, 2]))
-  addGeoSource('ambulance', [[121.476,31.216],[121.478,31.228],[121.496,31.235]], '#16a34a')
-  addGeoSource('bus', [[121.466,31.220],[121.480,31.229],[121.502,31.238]], '#d97706', [1, 1])
-  addGeoSource('adjacent', [[121.502,31.244],[121.514,31.236],[121.524,31.228]], '#7c3aed')
+  const stage = viewStage.value
+  if (stage) addGeoSource('closure', stage.route, store.activeSnapshot ? '#16a34a' : '#ef4444')
+  viewDetours.value.forEach((route, index) => addGeoSource(`detour-${index}`, route.coordinates, '#2563eb', [2, 2]))
+  addGeoSource('ambulance', [[121.476, 31.216], [121.478, 31.228], [121.496, 31.235]], '#16a34a')
+  addGeoSource('bus', [[121.466, 31.22], [121.48, 31.229], [121.502, 31.238]], '#d97706', [1, 1])
+  addGeoSource('adjacent', [[121.502, 31.244], [121.514, 31.236], [121.524, 31.228]], '#7c3aed')
 }
 function toggleLayer(id: string, visible: boolean) { if (map?.getLayer(id)) map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none') }
-function fit() { const bounds = new maplibregl.LngLatBounds(); store.scheme.stages.flatMap((stage) => stage.route).forEach((point) => bounds.extend(point)); map?.fitBounds(bounds, { padding: 60 }) }
-function getStageFromMap() { return store.selectedStage }
+function fit() { const bounds = new maplibregl.LngLatBounds(); viewStages.value.flatMap((stage) => stage.route).forEach((point) => bounds.extend(point)); map?.fitBounds(bounds, { padding: 60 }) }
 onMounted(async () => {
   await nextTick()
   map = new maplibregl.Map({
@@ -39,39 +44,90 @@ onMounted(async () => {
   map.on('click', (event) => store.addPoint([event.lngLat.lng, event.lngLat.lat]))
 })
 onBeforeUnmount(() => map?.remove())
-watch(() => store.selectedStageId, () => { if (!map) return; const stage = getStageFromMap(); if (stage) { map.flyTo({ center: stage.route[0], zoom: 14 }); drawAll() } })
+watch(() => store.selectedStageId, () => { if (map && viewStage.value) { map.flyTo({ center: viewStage.value.route[0], zoom: 14 }); drawAll() } })
+watch(viewStages, drawAll, { deep: true })
+watch(viewDetours, drawAll, { deep: true })
 watch(layers, () => {
   if (!map) return
   toggleLayer('closure', layers.value.closure)
-  store.scheme.detours.forEach((_, index) => toggleLayer(`detour-${index}`, layers.value.detour))
+  viewDetours.value.forEach((_, index) => toggleLayer(`detour-${index}`, layers.value.detour))
   toggleLayer('ambulance', layers.value.ambulance)
   toggleLayer('bus', layers.value.bus)
   toggleLayer('adjacent', layers.value.adjacent)
 }, { deep: true })
+
+function statusColor(status: string) {
+  return status === '已批准' ? 'green' : status === '退回' ? 'red' : status === '冲突待裁' ? 'red' : 'orange'
+}
+const currentHash = computed(() => viewStage.value ? geometryHash(viewStage.value).slice(0, 8) : '')
+const snapshotHash = computed(() => store.activeSnapshot?.geometryByStage[store.selectedStageId]?.slice(0, 8))
+const stageConflicts = computed(() => store.pendingConflicts.filter((c) => c.stageId === store.selectedStageId))
+
+function patchDetour(id: string, field: 'extraMinutes' | 'distance', value: number | undefined) {
+  if (typeof value === 'number') store.updateDetour(id, { [field]: value })
+}
 </script>
 
 <template>
-  <section class="page-head compact"><div><p class="eyebrow">几何与时间联动</p><h1>封路范围与阶段地图</h1><p>选择阶段后在地图上点击绘制路线；每次几何修改都会生成版本，审批意见锚定对应路段。</p></div><a-space><a-button @click="store.startDraw" :status="store.drawing ? 'danger' : undefined">{{ store.drawing ? `绘制中 · 已点 ${store.draftRoute.length} 个` : '绘制封路路线' }}</a-button><a-button :disabled="!store.drawing" type="primary" @click="store.finishDraw">完成绘制</a-button><a-button @click="fit">定位全段</a-button></a-space></section>
-  <div class="toolbar card"><a-radio-group v-model="store.selectedStageId" type="button"><a-radio v-for="stage in store.scheme.stages" :key="stage.id" :value="stage.id">{{ stage.id }}</a-radio></a-radio-group><span class="spacer"></span><a-checkbox v-model="layers.closure">封路</a-checkbox><a-checkbox v-model="layers.detour">绕行</a-checkbox><a-checkbox v-model="layers.ambulance">救护通道</a-checkbox><a-checkbox v-model="layers.bus">公交</a-checkbox><a-checkbox v-model="layers.adjacent">相邻工程</a-checkbox></div>
+  <section class="page-head compact">
+    <div>
+      <p class="eyebrow">几何与时间联动 · 三地同改</p>
+      <h1>封路范围与阶段地图</h1>
+      <p>地图、阶段计划、会签页改的是同一份数据；{{ store.online ? '在线编辑走 CAS 单条事务，后到窗口不覆盖先到。' : '当前离线，编辑将进入现场批次，回传时按批次合并。' }}</p>
+    </div>
+    <a-space>
+      <a-button @click="store.startDraw" :status="store.drawing ? 'danger' : undefined">{{ store.drawing ? `绘制中 · 已点 ${store.draftRoute.length} 个` : '绘制封路路线' }}</a-button>
+      <a-button :disabled="!store.drawing" type="primary" @click="store.finishDraw">完成绘制</a-button>
+      <a-button @click="fit">定位全段</a-button>
+    </a-space>
+  </section>
+
+  <a-alert v-if="store.activeSnapshot" type="success" class="mb16" :title="`地图按审批快照 ${store.activeSnapshot.id}（r${store.activeSnapshot.revision}）渲染判断 · 冻结于 ${store.activeSnapshot.frozenAt}`">
+    <template #extra><a-button size="small" @click="$router.push('/sync')">快照详情</a-button></template>
+    冻结后若改车道、绕行或应急条件，本快照立即失效，绿色已批准几何将退回当前草案。
+  </a-alert>
+  <a-alert v-else-if="store.invalidSnapshot" type="error" class="mb16" :title="`原审批快照 ${store.invalidSnapshot.id} 已失效：${store.invalidSnapshot.invalidReason}`" />
+  <a-alert v-else-if="!store.online" type="warning" class="mb16" title="离线作业中：以下编辑只进入现场批次，不改动当前几何，恢复连接后在「批次与审批」页回传合并。" />
+
+  <div class="toolbar card">
+    <a-radio-group v-model="store.selectedStageId" type="button"><a-radio v-for="stage in store.scheme.stages" :key="stage.id" :value="stage.id">{{ stage.id }}</a-radio></a-radio-group>
+    <span class="spacer"></span>
+    <a-checkbox v-model="layers.closure">封路</a-checkbox><a-checkbox v-model="layers.detour">绕行</a-checkbox><a-checkbox v-model="layers.ambulance">救护通道</a-checkbox><a-checkbox v-model="layers.bus">公交</a-checkbox><a-checkbox v-model="layers.adjacent">相邻工程</a-checkbox>
+  </div>
   <div class="map-grid">
     <div ref="mapEl" class="map"></div>
     <aside class="card inspector">
-      <div class="panel-head"><div><h2>{{ store.selectedStage?.name }}</h2><p>{{ store.selectedStage?.start }} → {{ store.selectedStage?.end }}</p></div><a-tag :color="store.selectedStage?.status === '退回' ? 'red' : 'orange'">{{ store.selectedStage?.status }}</a-tag></div>
+      <div class="panel-head">
+        <div><h2>{{ viewStage?.name }}</h2><p>{{ viewStage?.start }} → {{ viewStage?.end }}</p><small>几何哈希 {{ currentHash }}<template v-if="snapshotHash"> · 快照 {{ snapshotHash }}</template></small></div>
+        <a-tag :color="statusColor(store.stageStatus(store.selectedStageId))">{{ store.stageStatus(store.selectedStageId) }}</a-tag>
+      </div>
+      <a-alert v-for="conflict in stageConflicts" :key="conflict.id" type="error" class="mb10" :title="`合并冲突 · ${conflict.fieldLabel}：两份内容都已保留`">
+        <template #extra><a-button size="mini" type="text" @click="$router.push('/sync')">去裁定</a-button></template>
+      </a-alert>
       <a-form layout="vertical" :model="store.selectedStage || {}">
-        <a-form-item label="车道占用"><a-input :model-value="store.selectedStage?.lanes" @change="(value: string) => store.updateStage({ lanes: value })" /></a-form-item>
+        <a-form-item label="车道占用（冻结后修改将令审批失效）"><a-input :model-value="store.selectedStage?.lanes" @change="(value: string) => store.updateStage({ lanes: value })" /></a-form-item>
         <a-form-item label="阶段名称"><a-input :model-value="store.selectedStage?.name" @change="(value: string) => store.updateStage({ name: value })" /></a-form-item>
-        <div class="two"><a-form-item label="开始"><a-date-picker :model-value="store.selectedStage?.start" @change="(value: any) => store.updateStage({ start: value })" /></a-form-item><a-form-item label="结束"><a-date-picker :model-value="store.selectedStage?.end" @change="(value: any) => store.updateStage({ end: value })" /></a-form-item></div>
+        <div class="two"><a-form-item label="开始"><a-date-picker :model-value="store.selectedStage?.start" @change="(value: any) => store.updateStage({ start: value })"></a-date-picker></a-form-item><a-form-item label="结束"><a-date-picker :model-value="store.selectedStage?.end" @change="(value: any) => store.updateStage({ end: value })"></a-date-picker></a-form-item></div>
       </a-form>
-      <h3>绕行比较</h3>
-      <div v-for="route in store.scheme.detours" :key="route.id" class="detour"><div><b>{{ route.name }}</b><small>{{ route.distance }} km · 增加 {{ route.extraMinutes }} 分钟</small></div><a-tag :color="route.extraMinutes > 10 ? 'orange' : 'green'">{{ route.extraMinutes > 10 ? '关注' : '可用' }}</a-tag></div>
+      <h3>绕行比较<small v-if="store.activeSnapshot" class="snap-note">（快照值）</small></h3>
+      <div v-for="route in viewDetours" :key="route.id" class="detour">
+        <div><b>{{ route.name }}</b>
+          <small>{{ route.distance }} km · 增加
+            <a-input-number v-if="!store.activeSnapshot" size="mini" :model-value="route.extraMinutes" :step="1" style="width:64px;margin:0 4px" @change="(v: number | undefined) => patchDetour(route.id, 'extraMinutes', v)" />
+            <template v-else>{{ route.extraMinutes }}</template>
+            分钟
+          </small>
+        </div>
+        <a-tag :color="route.extraMinutes > 10 ? 'orange' : 'green'">{{ route.extraMinutes > 10 ? '关注' : '可用' }}</a-tag>
+      </div>
       <a-divider />
       <h3>路段冲突</h3>
-      <div v-for="item in store.conflicts.filter((conflict) => conflict.segmentId === store.selectedStageId)" :key="item.id" class="issue" :class="item.level === '高' ? 'red' : 'amber'"><b>{{ item.title }}</b><p>{{ item.detail }}</p></div>
+      <div v-for="item in store.staticConflicts.filter((conflict) => conflict.segmentId === store.selectedStageId)" :key="item.id" class="issue" :class="item.level === '高' ? 'red' : 'amber'"><b>{{ item.title }}</b><p>{{ item.detail }}</p></div>
     </aside>
   </div>
 </template>
 
 <style scoped>
-.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px;margin-bottom:14px}.spacer{flex:1}.map-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(330px,.65fr);gap:16px}.map{height:min(68vh,680px);min-height:420px;border-radius:8px;overflow:hidden}.inspector{height:fit-content}.panel-head{display:flex;justify-content:space-between}.panel-head h2{font-size:18px;margin:0 0 5px}.panel-head p{color:#7a8798;font-size:12px;margin:0}.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}.inspector h3{font-size:14px;margin:18px 0 10px}.detour{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #edf0f5}.detour b,.detour small{display:block}.detour small{color:#7a8798;margin-top:4px}.issue{padding:10px;border-radius:6px;margin-bottom:8px}.issue.red{background:#fff1f2}.issue.amber{background:#fff7ed}.issue p{margin:4px 0 0;color:#64748b;font-size:13px}
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px;margin-bottom:14px}.spacer{flex:1}.map-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(330px,.65fr);gap:16px}.map{height:min(68vh,680px);min-height:420px;border-radius:8px;overflow:hidden}.inspector{height:fit-content}.panel-head{display:flex;justify-content:space-between}.panel-head h2{font-size:18px;margin:0 0 5px}.panel-head p{color:#7a8798;font-size:12px;margin:0}.panel-head small{color:#94a3b8;font-size:11px}.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}.inspector h3{font-size:14px;margin:18px 0 10px}.snap-note{color:#16a34a;font-size:11px}.detour{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #edf0f5}.detour b,.detour small{display:block}.detour small{color:#7a8798;margin-top:4px}.issue{padding:10px;border-radius:6px;margin-bottom:8px}.issue.red{background:#fff1f2}.issue.amber{background:#fff7ed}.issue p{margin:4px 0 0;color:#64748b;font-size:13px}.mb10{margin-bottom:10px}
 @media(max-width:1050px){.map-grid{grid-template-columns:1fr}.map{height:55vh}}
 </style>
