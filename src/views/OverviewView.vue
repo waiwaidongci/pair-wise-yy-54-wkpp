@@ -6,11 +6,16 @@ import { useSchemeStore } from '../store/scheme'
 
 const store = useSchemeStore()
 const { result, loading, error } = useQuery(SCHEME_QUERY)
+
+/** 冻结后总览按快照判断 */
+const viewStages = computed(() => store.snapshot?.status === 'frozen' ? store.snapshot.stages : store.scheme.stages)
+const isFrozen = computed(() => store.snapshot?.status === 'frozen')
+
 const stats = computed(() => [
-  { label: '施工阶段', value: store.scheme.stages.length, note: '跨 42 天' },
-  { label: '生效冲突', value: store.conflicts.filter((item) => item.level === '高').length, note: '需阶段审批前解决' },
+  { label: '施工阶段', value: viewStages.value.length, note: '跨 42 天' },
+  { label: '生效冲突', value: store.ruleConflicts.filter((item) => item.level === '高').length, note: '需阶段审批前解决' },
   { label: '待处理条件', value: store.scheme.comments.filter((item) => item.status === '待处理').length, note: '公交单位尚有 1 条' },
-  { label: '方案版本', value: `v${result.value?.scheme?.version ?? store.scheme.version}`, note: '每次几何修改留痕' },
+  { label: '方案版本', value: `v${isFrozen.value ? store.snapshot!.schemeVersion : (result.value?.scheme?.version ?? store.scheme.version)}`, note: isFrozen.value ? '已冻结快照版本' : '每次几何修改留痕' },
 ])
 </script>
 
@@ -18,16 +23,18 @@ const stats = computed(() => [
   <section class="page-head"><div><p class="eyebrow">建设 · 交通 · 公交 · 应急</p><h1>封路方案协调总览</h1><p>在同一地图与阶段计划下核验相邻工程、生命通道、公交覆盖与绕行时延。</p></div><a-space><a-button>公开通告预览</a-button><a-button type="primary" @click="$router.push('/map')">编辑封路方案</a-button></a-space></section>
   <a-spin :loading="loading" style="width:100%">
     <a-alert v-if="error" type="error" title="GraphQL 请求异常，已使用本地草案" class="mb16" />
+    <a-alert v-if="isFrozen" type="success" class="mb16" title="审批快照已冻结" :content="`总览数据以冻结快照为准（v${store.snapshot!.schemeVersion}），冻结后车道、绕行或应急条件变更将导致审批立即失效。`" />
+    <a-alert v-else-if="store.snapshot?.status === 'invalidated'" type="error" class="mb16" title="审批快照已失效" :content="store.snapshot.invalidatedReason || '冻结后条件发生变化，原审批立即失效。'" />
     <div class="metrics"><article v-for="item in stats" :key="item.label" class="card metric"><span>{{ item.label }}</span><strong>{{ item.value }}</strong><small>{{ item.note }}</small></article></div>
     <div class="grid-2">
       <article class="card">
         <div class="panel-head"><div><h2>施工阶段时间轴</h2><p>点击阶段查看范围与道路占用</p></div><a-tag color="orange">42 天计划</a-tag></div>
-        <a-table :data="store.scheme.stages" :pagination="false" row-key="id" @row-click="(row: any) => { store.selectedStageId = row.id; $router.push('/map') }">
+        <a-table :data="viewStages" :pagination="false" row-key="id" @row-click="(row: any) => { store.selectedStageId = row.id; $router.push('/map') }">
           <template #columns><a-table-column title="阶段" data-index="name" /><a-table-column title="时间" :width="190"><template #cell="{ record }">{{ record.start }} → {{ record.end }}</template></a-table-column><a-table-column title="车道方案" data-index="lanes" /><a-table-column title="状态" :width="100"><template #cell="{ record }"><a-tag :color="record.status === '已批准' ? 'green' : record.status === '退回' ? 'red' : 'orange'">{{ record.status }}</a-tag></template></a-table-column></template></a-table>
       </article>
       <article class="card">
-        <div class="panel-head"><div><h2>规则检测结果</h2><p>按影响等级排序</p></div><a-tag color="red">{{ store.conflicts.filter((item) => item.level === '高').length }} 高风险</a-tag></div>
-        <div v-for="item in store.conflicts" :key="item.id" class="conflict" :class="item.level === '高' ? 'red' : 'amber'"><div><b>{{ item.title }}</b><small>{{ item.segmentId }}</small></div><a-tag :color="item.level === '高' ? 'red' : 'orange'">{{ item.level }}</a-tag><p>{{ item.detail }}</p><a-button size="mini" type="text" @click="store.selectedStageId = item.segmentId; $router.push('/map')">定位路段</a-button></div>
+        <div class="panel-head"><div><h2>规则检测结果</h2><p>按影响等级排序</p></div><a-tag color="red">{{ store.ruleConflicts.filter((item) => item.level === '高').length }} 高风险</a-tag></div>
+        <div v-for="item in store.ruleConflicts" :key="item.id" class="conflict" :class="item.level === '高' ? 'red' : 'amber'"><div><b>{{ item.title }}</b><small>{{ item.segmentId }}</small></div><a-tag :color="item.level === '高' ? 'red' : 'orange'">{{ item.level }}</a-tag><p>{{ item.detail }}</p><a-button size="mini" type="text" @click="store.selectedStageId = item.segmentId; $router.push('/map')">定位路段</a-button></div>
       </article>
     </div>
     <article class="card mt16"><div class="panel-head"><div><h2>会签单位与条件</h2><p>意见锚定具体分段，原记录不覆盖</p></div><a-button type="text" @click="$router.push('/review')">进入会签</a-button></div><div class="agency-grid"><div v-for="agency in result?.agencies || []" :key="agency.id" class="agency"><span>{{ agency.role }}</span><div><b>{{ agency.name }}</b><small>{{ agency.role === '公交' ? '1 条待处理' : agency.role === '应急' ? '条件已接受' : '暂无新增意见' }}</small></div><a-tag :color="agency.role === '公交' ? 'orange' : 'green'">{{ agency.role === '公交' ? '待处理' : '已响应' }}</a-tag></div></div></article>

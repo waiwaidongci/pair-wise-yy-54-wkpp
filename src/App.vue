@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useRoute, useRouter } from 'vue-router'
+import { Message } from '@arco-design/web-vue'
 import { useSchemeStore } from './store/scheme'
 
 const route = useRoute()
@@ -10,6 +11,12 @@ const nav = [
   { name: 'map', label: '地图与阶段' },
   { name: 'review', label: '多单位会签' },
 ]
+
+function freeze() {
+  const result = store.freezeSnapshot()
+  if (result.ok) Message.success('审批快照已冻结，地图、总览与公开通告将以此为准')
+  else Message.warning(result.reason || '无法冻结快照')
+}
 </script>
 
 <template>
@@ -24,7 +31,14 @@ const nav = [
     <a-layout>
       <a-layout-header class="topbar">
         <div><b>{{ store.scheme.id }}</b><span>{{ store.scheme.area }} · 2026 年第四季度施工计划</span></div>
-        <div class="top-actions"><a-tag color="green">协同在线 11</a-tag><a-button :disabled="!store.dirty" @click="store.undo">撤销修改</a-button><a-button type="primary">发起阶段审批</a-button></div>
+        <div class="top-actions">
+          <a-tag v-if="store.snapshot?.status === 'frozen'" color="green">审批快照已冻结 · v{{ store.snapshot.schemeVersion }}</a-tag>
+          <a-tag v-else-if="store.snapshot?.status === 'invalidated'" color="red">快照已失效</a-tag>
+          <a-tag v-if="store.conflicts.filter(c => !c.resolved).length" color="orange">{{ store.conflicts.filter(c => !c.resolved).length }} 处冲突待处理</a-tag>
+          <a-tag color="green">协同在线 11</a-tag>
+          <a-button :disabled="!store.dirty" @click="store.undo">撤销修改</a-button>
+          <a-button type="primary" :disabled="!store.canFreeze || store.snapshot?.status === 'frozen'" @click="freeze">冻结审批快照</a-button>
+        </div>
       </a-layout-header>
       <a-layout-content class="main"><router-view /></a-layout-content>
     </a-layout>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
 import { useSchemeStore } from '../store/scheme'
 
@@ -7,6 +7,11 @@ const store = useSchemeStore()
 const mapEl = ref<HTMLDivElement>()
 let map: MapLibreMap | undefined
 const layers = ref({ closure: true, detour: true, ambulance: true, bus: true, adjacent: true })
+
+/** 冻结后地图按快照判断，而非实时草案 */
+const viewStages = computed(() => store.snapshot?.status === 'frozen' ? store.snapshot.stages : store.scheme.stages)
+const viewDetours = computed(() => store.snapshot?.status === 'frozen' ? store.snapshot.detours : store.scheme.detours)
+const isFrozen = computed(() => store.snapshot?.status === 'frozen')
 
 function addGeoSource(id: string, coordinates: [number, number][], color: string, dasharray?: number[]) {
   if (!map?.isStyleLoaded()) return
@@ -17,16 +22,15 @@ function addGeoSource(id: string, coordinates: [number, number][], color: string
 
 function drawAll() {
   if (!map?.isStyleLoaded()) return
-  const stage = store.selectedStage
+  const stage = viewStages.value.find((s) => s.id === store.selectedStageId)
   if (stage) addGeoSource('closure', stage.route, '#ef4444')
-  store.scheme.detours.forEach((route, index) => addGeoSource(`detour-${index}`, route.coordinates, '#2563eb', [2, 2]))
+  viewDetours.value.forEach((route, index) => addGeoSource(`detour-${index}`, route.coordinates, '#2563eb', [2, 2]))
   addGeoSource('ambulance', [[121.476,31.216],[121.478,31.228],[121.496,31.235]], '#16a34a')
   addGeoSource('bus', [[121.466,31.220],[121.480,31.229],[121.502,31.238]], '#d97706', [1, 1])
   addGeoSource('adjacent', [[121.502,31.244],[121.514,31.236],[121.524,31.228]], '#7c3aed')
 }
 function toggleLayer(id: string, visible: boolean) { if (map?.getLayer(id)) map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none') }
-function fit() { const bounds = new maplibregl.LngLatBounds(); store.scheme.stages.flatMap((stage) => stage.route).forEach((point) => bounds.extend(point)); map?.fitBounds(bounds, { padding: 60 }) }
-function getStageFromMap() { return store.selectedStage }
+function fit() { const bounds = new maplibregl.LngLatBounds(); viewStages.value.flatMap((stage) => stage.route).forEach((point) => bounds.extend(point)); map?.fitBounds(bounds, { padding: 60 }) }
 onMounted(async () => {
   await nextTick()
   map = new maplibregl.Map({
@@ -36,14 +40,15 @@ onMounted(async () => {
   })
   map.addControl(new maplibregl.NavigationControl(), 'top-right')
   map.on('load', drawAll)
-  map.on('click', (event) => store.addPoint([event.lngLat.lng, event.lngLat.lat]))
+  map.on('click', (event) => { if (!isFrozen.value) store.addPoint([event.lngLat.lng, event.lngLat.lat]) })
 })
 onBeforeUnmount(() => map?.remove())
-watch(() => store.selectedStageId, () => { if (!map) return; const stage = getStageFromMap(); if (stage) { map.flyTo({ center: stage.route[0], zoom: 14 }); drawAll() } })
+watch(() => store.selectedStageId, () => { if (!map) return; const stage = viewStages.value.find((s) => s.id === store.selectedStageId); if (stage) { map.flyTo({ center: stage.route[0], zoom: 14 }); drawAll() } })
+watch(viewStages, () => drawAll(), { deep: true })
 watch(layers, () => {
   if (!map) return
   toggleLayer('closure', layers.value.closure)
-  store.scheme.detours.forEach((_, index) => toggleLayer(`detour-${index}`, layers.value.detour))
+  viewDetours.value.forEach((_, index) => toggleLayer(`detour-${index}`, layers.value.detour))
   toggleLayer('ambulance', layers.value.ambulance)
   toggleLayer('bus', layers.value.bus)
   toggleLayer('adjacent', layers.value.adjacent)
@@ -51,22 +56,24 @@ watch(layers, () => {
 </script>
 
 <template>
-  <section class="page-head compact"><div><p class="eyebrow">几何与时间联动</p><h1>封路范围与阶段地图</h1><p>选择阶段后在地图上点击绘制路线；每次几何修改都会生成版本，审批意见锚定对应路段。</p></div><a-space><a-button @click="store.startDraw" :status="store.drawing ? 'danger' : undefined">{{ store.drawing ? `绘制中 · 已点 ${store.draftRoute.length} 个` : '绘制封路路线' }}</a-button><a-button :disabled="!store.drawing" type="primary" @click="store.finishDraw">完成绘制</a-button><a-button @click="fit">定位全段</a-button></a-space></section>
-  <div class="toolbar card"><a-radio-group v-model="store.selectedStageId" type="button"><a-radio v-for="stage in store.scheme.stages" :key="stage.id" :value="stage.id">{{ stage.id }}</a-radio></a-radio-group><span class="spacer"></span><a-checkbox v-model="layers.closure">封路</a-checkbox><a-checkbox v-model="layers.detour">绕行</a-checkbox><a-checkbox v-model="layers.ambulance">救护通道</a-checkbox><a-checkbox v-model="layers.bus">公交</a-checkbox><a-checkbox v-model="layers.adjacent">相邻工程</a-checkbox></div>
+  <section class="page-head compact"><div><p class="eyebrow">几何与时间联动</p><h1>封路范围与阶段地图</h1><p>选择阶段后在地图上点击绘制路线；每次几何修改都会生成版本，审批意见锚定对应路段。</p></div><a-space><a-button @click="store.startDraw" :disabled="isFrozen" :status="store.drawing ? 'danger' : undefined">{{ store.drawing ? `绘制中 · 已点 ${store.draftRoute.length} 个` : '绘制封路路线' }}</a-button><a-button :disabled="!store.drawing || isFrozen" type="primary" @click="store.finishDraw">完成绘制</a-button><a-button @click="fit">定位全段</a-button></a-space></section>
+  <a-alert v-if="isFrozen" type="success" class="mb16" title="审批快照已冻结" content="地图当前展示冻结快照，车道、绕行或应急条件变更将导致审批立即失效。" />
+  <a-alert v-else-if="store.snapshot?.status === 'invalidated'" type="error" class="mb16" title="审批快照已失效" :content="store.snapshot.invalidatedReason || '冻结后条件发生变化，原审批立即失效。'" />
+  <div class="toolbar card"><a-radio-group v-model="store.selectedStageId" type="button"><a-radio v-for="stage in viewStages" :key="stage.id" :value="stage.id">{{ stage.id }}</a-radio></a-radio-group><span class="spacer"></span><a-checkbox v-model="layers.closure">封路</a-checkbox><a-checkbox v-model="layers.detour">绕行</a-checkbox><a-checkbox v-model="layers.ambulance">救护通道</a-checkbox><a-checkbox v-model="layers.bus">公交</a-checkbox><a-checkbox v-model="layers.adjacent">相邻工程</a-checkbox></div>
   <div class="map-grid">
     <div ref="mapEl" class="map"></div>
     <aside class="card inspector">
       <div class="panel-head"><div><h2>{{ store.selectedStage?.name }}</h2><p>{{ store.selectedStage?.start }} → {{ store.selectedStage?.end }}</p></div><a-tag :color="store.selectedStage?.status === '退回' ? 'red' : 'orange'">{{ store.selectedStage?.status }}</a-tag></div>
       <a-form layout="vertical" :model="store.selectedStage || {}">
-        <a-form-item label="车道占用"><a-input :model-value="store.selectedStage?.lanes" @change="(value: string) => store.updateStage({ lanes: value })" /></a-form-item>
-        <a-form-item label="阶段名称"><a-input :model-value="store.selectedStage?.name" @change="(value: string) => store.updateStage({ name: value })" /></a-form-item>
-        <div class="two"><a-form-item label="开始"><a-date-picker :model-value="store.selectedStage?.start" @change="(value: any) => store.updateStage({ start: value })" /></a-form-item><a-form-item label="结束"><a-date-picker :model-value="store.selectedStage?.end" @change="(value: any) => store.updateStage({ end: value })" /></a-form-item></div>
+        <a-form-item label="车道占用"><a-input :model-value="store.selectedStage?.lanes" :disabled="isFrozen" @change="(value: string) => store.updateStage({ lanes: value })" /></a-form-item>
+        <a-form-item label="阶段名称"><a-input :model-value="store.selectedStage?.name" :disabled="isFrozen" @change="(value: string) => store.updateStage({ name: value })" /></a-form-item>
+        <div class="two"><a-form-item label="开始"><a-date-picker :model-value="store.selectedStage?.start" :disabled="isFrozen" @change="(value: any) => store.updateStage({ start: value })" /></a-form-item><a-form-item label="结束"><a-date-picker :model-value="store.selectedStage?.end" :disabled="isFrozen" @change="(value: any) => store.updateStage({ end: value })" /></a-form-item></div>
       </a-form>
       <h3>绕行比较</h3>
-      <div v-for="route in store.scheme.detours" :key="route.id" class="detour"><div><b>{{ route.name }}</b><small>{{ route.distance }} km · 增加 {{ route.extraMinutes }} 分钟</small></div><a-tag :color="route.extraMinutes > 10 ? 'orange' : 'green'">{{ route.extraMinutes > 10 ? '关注' : '可用' }}</a-tag></div>
+      <div v-for="route in viewDetours" :key="route.id" class="detour"><div><b>{{ route.name }}</b><small>{{ route.distance }} km · 增加 {{ route.extraMinutes }} 分钟</small></div><a-tag :color="route.extraMinutes > 10 ? 'orange' : 'green'">{{ route.extraMinutes > 10 ? '关注' : '可用' }}</a-tag></div>
       <a-divider />
       <h3>路段冲突</h3>
-      <div v-for="item in store.conflicts.filter((conflict) => conflict.segmentId === store.selectedStageId)" :key="item.id" class="issue" :class="item.level === '高' ? 'red' : 'amber'"><b>{{ item.title }}</b><p>{{ item.detail }}</p></div>
+      <div v-for="item in store.ruleConflicts.filter((conflict) => conflict.segmentId === store.selectedStageId)" :key="item.id" class="issue" :class="item.level === '高' ? 'red' : 'amber'"><b>{{ item.title }}</b><p>{{ item.detail }}</p></div>
     </aside>
   </div>
 </template>
